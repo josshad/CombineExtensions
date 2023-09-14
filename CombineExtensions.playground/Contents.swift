@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 // MARK: Tests
-class PublisherTest: XCTestCase {
+final class PublisherTests: XCTestCase {
     private var cancellables = Set<AnyCancellable>()
     func testWithLatestFrom_EmitsEvent_FirstSequenceEmitsAfterSecond() {
         // :given
@@ -251,8 +251,177 @@ class PublisherTest: XCTestCase {
     }
 }
 
-PublisherTest.defaultTestSuite.run()
+final class SignalTests: XCTestCase {
+    private var cancellables: Set<AnyCancellable>!
 
+    override func setUp() {
+        super.setUp()
+        cancellables = []
+    }
+
+    override func tearDown() {
+        cancellables = nil
+        super.tearDown()
+    }
+
+    func testSignal_EmitsElementsOnMainQueue() {
+        // :given
+        let publisher = [1].publisher
+            .receive(on: DispatchQueue(label: "test queue", qos: .userInitiated))
+
+        let signal = publisher.asSignal()
+        let exp = expectation(description: #function)
+
+        // :when
+        signal
+            .sink(
+                receiveValue: { _ in
+                    XCTDispatchAssertQueue(.main)
+                    exp.fulfill()
+                }
+            )
+            .store(in: &cancellables)
+
+        // :then
+        waitForExpectations(timeout: 1)
+    }
+
+    func testSignal_EmitsElementsOnSameRunLoopCycle_IfElementEmitsOnMainQueueOriginally() {
+        // :given
+        let refArray = [1, 2, 3]
+        let publisher = refArray.publisher
+        let signal = publisher.asSignal()
+
+        // :when
+        var result: [Int] = []
+        signal
+            .sink {
+                result.append($0)
+            }
+            .store(in: &cancellables)
+
+        // :then
+        XCTAssertEqual(result, refArray)
+    }
+
+    func testSignal_SharesInitialPublisher_UnlikeTheAnyPublisher() {
+        // :given
+        let queue = DispatchQueue.init(label: "Publisher queue")
+
+        let initialPublisher = [(1, 0), (2, 300), (3, 400)]
+            .delayedPublisher()
+            .receive(on: queue)
+        let signal = initialPublisher.asSignal()
+        let publisher = initialPublisher.eraseToAnyPublisherOnMain()
+
+        var firstSignalArray: [Int] = []
+        var firstPublisherArray: [Int] = []
+        var secondSignalArray: [Int] = []
+        var secondPublisherArray: [Int] = []
+        let exp = expectation(description: "Wait for all publishers")
+        exp.expectedFulfillmentCount = 4
+
+        let preExp = expectation(description: "Wait for first values")
+        preExp.expectedFulfillmentCount = 2
+        preExp.assertForOverFulfill = false
+
+        signal
+            .xctExpectsCompletion(with: exp) {
+                firstSignalArray.append($0)
+                preExp.fulfill()
+            }
+            .store(in: &cancellables)
+        publisher
+            .xctExpectsCompletion(with: exp) {
+                firstPublisherArray.append($0)
+                preExp.fulfill()
+            }
+            .store(in: &cancellables)
+
+        // :when
+        wait(for: [preExp])
+        signal
+            .xctExpectsCompletion(with: exp) { secondSignalArray.append($0) }
+            .store(in: &cancellables)
+
+        publisher
+            .xctExpectsCompletion(with: exp) { secondPublisherArray.append($0) }
+            .store(in: &cancellables)
+
+        // :then
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(firstSignalArray, firstPublisherArray)
+        XCTAssertEqual(firstPublisherArray, secondPublisherArray)
+        XCTAssertEqual(firstSignalArray, [1, 2, 3])
+        XCTAssertEqual(secondSignalArray, [2, 3])
+    }
+
+    func testSignal_EmitsCompletionOnMainQueue_IfInitialPublisherReceivesOnAnotherQueue() {
+        // :given
+        let publisher = [Int]().publisher
+            .delay(for: 0.01, scheduler: DispatchQueue.main)
+            .receive(on: DispatchQueue(label: "test queue", qos: .userInitiated))
+        print("Kek 2")
+        let signal = publisher.asSignal()
+        print("Kek 1")
+        let exp = expectation(description: "Wait for completion")
+        print("Kek")
+
+        // :when
+        signal
+            .sink(
+                receiveCompletion: { _ in
+                    print("Lol")
+                    XCTDispatchAssertQueue(.main)
+                    print("XXX")
+                    exp.fulfill()
+                },
+                receiveValue: { _ in
+
+                }
+            )
+            .store(in: &cancellables)
+
+        // :then
+        print("ololo")
+        waitForExpectations(timeout: 1)
+    }
+
+    func testSignal_EmitsCompletionOnMainQueue_IfValuesAndCompletionReceivedAsynAfterSubscription() {
+        // :given
+        let subject = PassthroughSubject<Int, Never>()
+        let signal = subject.asSignal()
+        let exp = expectation(description: #function)
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(1)) {
+            subject.send(1)
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(100)) {
+            subject.send(completion: .finished)
+        }
+
+        // :when
+        signal
+            .sink(
+                receiveCompletion: { _ in
+                    XCTDispatchAssertQueue(.main)
+                    exp.fulfill()
+                },
+                receiveValue: { _ in
+
+                }
+            )
+            .store(in: &cancellables)
+
+        // :then
+        waitForExpectations(timeout: 1)
+    }
+}
+
+PublisherTests.defaultTestSuite.run()
+SignalTests.defaultTestSuite.run()
+
+// MARK: Test helpers
 extension Materialized: Equatable where Value: Equatable, Failure: Equatable {
     public static func == (lhs: Materialized, rhs: Materialized) -> Bool {
         switch (lhs, rhs) {
@@ -261,5 +430,63 @@ extension Materialized: Equatable where Value: Equatable, Failure: Equatable {
         case (.value(let lv), .value(let rv)): return lv == rv
         default: return false
         }
+    }
+}
+
+private extension Publisher where Failure == Never, Output == Int {
+    func xctExpectsCompletion(
+        with exp: XCTestExpectation,
+        receiveValue: @escaping (Int) -> Void
+    ) -> AnyCancellable {
+        sink(
+            receiveCompletion: { _ in exp.fulfill() },
+            receiveValue: receiveValue
+        )
+    }
+}
+
+extension Array {
+    func delayedPublisher<E>() -> AnyPublisher<E, Never> where Element == (E, Int) {
+        publisher
+            .flatMap { e -> AnyPublisher<E, Never> in
+                let (element, delay) = e
+                return AnyPublisher.just(element)
+                    .delay(for: .milliseconds(delay), scheduler: RunLoop.main)
+                    .eraseToAnyPublisher()
+            }
+            .eraseToAnyPublisher()
+    }
+}
+
+private func XCTDispatchAssertQueue(
+    _ queue: DispatchQueue,
+    _ message: String = "XCTDispatchAssertQueue failed") {
+    if !queue.isCurrentQueue {
+        print("Keks")
+        XCTFail(message)
+        print("sKek")
+    }
+}
+
+private func XCTDispatchAssertNotQueue(
+    _ queue: DispatchQueue,
+    _ message: String = "XCTDispatchAssertNotQueue failed"
+) {
+    if queue.isCurrentQueue {
+        XCTFail(message)
+    }
+}
+
+private class QueueKey {
+    static var shared = QueueKey()
+    let currentQueueKey = DispatchSpecificKey<UUID>()
+}
+
+private extension DispatchQueue {
+    var isCurrentQueue: Bool {
+        let value = UUID()
+        let key = QueueKey.shared.currentQueueKey
+        setSpecific(key: key, value: value)
+        return DispatchQueue.getSpecific(key: key) == value
     }
 }

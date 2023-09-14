@@ -3,6 +3,11 @@ import Combine
 
 // MARK: Extensions
 public extension Publisher {
+  func eraseToAnyPublisherOnMain() -> AnyPublisher<Output, Failure> {
+    receive(on: DispatchQueue.main)
+      .eraseToAnyPublisher()
+  }
+
   func compactMap<T>() -> Publishers.CompactMap<Self, T> where Output == T? {
     compactMap { $0 }
   }
@@ -34,6 +39,28 @@ public extension Publisher {
         .map { $0 + [$1] }
         .eraseToAnyPublisher()
     }
+  }
+
+  func handleEvents(
+    receiveSubscription: ((Subscription) -> Void)? = nil,
+    receiveOutput: ((Self.Output) -> Void)? = nil,
+    receiveSuccess: (() -> Void)? = nil,
+    receiveFailure: ((Self.Failure) -> Void)? = nil,
+    receiveCancel: (() -> Void)? = nil,
+    receiveRequest: ((Subscribers.Demand) -> Void)? = nil
+  ) -> Publishers.HandleEvents<Self> {
+    handleEvents(
+      receiveSubscription: receiveSubscription,
+      receiveOutput: receiveOutput,
+      receiveCompletion: { completion in
+        switch completion {
+        case .finished: receiveSuccess?()
+        case .failure(let err): receiveFailure?(err)
+        }
+      },
+      receiveCancel: receiveCancel,
+      receiveRequest: receiveRequest
+    )
   }
 
   func withLatestFrom<P>(
