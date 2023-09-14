@@ -2,51 +2,6 @@ import Combine
 import Foundation
 import XCTest
 
-// MARK: Extensions
-extension Publisher {
-    func withLatestFrom<P>(
-        _ other: P
-    ) -> AnyPublisher<(Self.Output, P.Output), Failure> where P: Publisher, Self.Failure == P.Failure {
-        drop(untilOutputFrom: other)
-            .map { (value: $0, token: arc4random()) }
-            .combineLatest(other)
-            .removeDuplicates(by: { (old, new) in
-                let lhs = old.0, rhs = new.0
-                return lhs.token == rhs.token
-            })
-            .map { ($0.value, $1) }
-            .eraseToAnyPublisher()
-    }
-
-    func ignoreErrorJustComplete(_ onError: ((Error) -> Void)? = nil) -> AnyPublisher<Output, Never> {
-        self
-            .catch({ error -> AnyPublisher<Output, Never> in
-                onError?(error)
-                return .empty()
-            })
-            .eraseToAnyPublisher()
-    }
-}
-
-extension AnyPublisher {
-    static func just(_ o: Output) -> Self {
-        Just<Output>(o).setFailureType(to: Failure.self).eraseToAnyPublisher()
-    }
-
-    static func error(_ f: Failure) -> Self {
-        Fail<Output, Failure>(error: f).eraseToAnyPublisher()
-    }
-
-    static func empty() -> Self {
-        Empty<Output, Failure>().eraseToAnyPublisher()
-    }
-
-    static func never() -> Self {
-        Empty<Output, Failure>(completeImmediately: false).eraseToAnyPublisher()
-    }
-}
-
-
 // MARK: Tests
 class PublisherTest: XCTestCase {
     private var cancellables = Set<AnyCancellable>()
@@ -133,6 +88,178 @@ class PublisherTest: XCTestCase {
         XCTAssertEqual(refResult.map(\.0), unwrappedResult.map(\.0))
         XCTAssertEqual(refResult.map(\.1), unwrappedResult.map(\.1))
     }
+
+    // MARK: Materialize
+    func testMaterialize_CorrectStreamWithCompletion() {
+        // :given
+        let stream = [1, 2, 3].publisher
+        let refEvents: [Materialized<Int, Never>] = [.value(1), .value(2), .value(3), .completed]
+
+        // :when
+        var events: [Materialized<Int, Never>] = []
+        stream
+            .materialize()
+            .sink {
+                events.append($0)
+            }
+            .store(in: &cancellables)
+
+        // :then
+        XCTAssertEqual(events, refEvents)
+    }
+
+    func testMaterialize_CorrectEmptyStream() {
+        // :given
+        let stream = [Int]().publisher
+        let refEvents: [Materialized<Int, Never>] = [.completed]
+
+        // :when
+        var events: [Materialized<Int, Never>] = []
+        stream
+            .materialize()
+            .sink {
+                events.append($0)
+            }
+            .store(in: &cancellables)
+
+        // :then
+        XCTAssertEqual(events, refEvents)
+    }
+
+    func testMaterialize_CorrectErrorStream() {
+        // :given
+        let error = NSError(domain: "Test domain", code: 1234, userInfo: nil)
+        let stream = AnyPublisher<Int, NSError>.error(error)
+        let refEvents: [Materialized<Int, NSError>] = [.failed(error)]
+
+        // :when
+        var events: [Materialized<Int, NSError>] = []
+        stream
+            .materialize()
+            .sink {
+                events.append($0)
+            }
+            .store(in: &cancellables)
+
+        // :then
+        XCTAssertEqual(events, refEvents)
+    }
+
+    func testMaterialize_CorrectValueAndErrorStream() {
+        // :given
+        let error = NSError(domain: "Test domain", code: 1234, userInfo: nil)
+        let stream = AnyPublisher<Int, NSError>.error(error)
+            .prepend(1)
+        let refEvents: [Materialized<Int, NSError>] = [.value(1), .failed(error)]
+
+        // :when
+        var events: [Materialized<Int, NSError>] = []
+        stream
+            .materialize()
+            .sink {
+                events.append($0)
+            }
+            .store(in: &cancellables)
+
+        // :then
+        XCTAssertEqual(events, refEvents)
+    }
+
+    func testMaterialize_CorrectInfiniteEmptyStream() {
+        // :given
+        let stream = AnyPublisher<Int, Never>.never()
+        let exp = expectation(description: "Should not called")
+        exp.isInverted = true
+
+        // :when
+        stream
+            .materialize()
+            .sink { _ in
+                exp.fulfill()
+            }
+            .store(in: &cancellables)
+
+        // :then
+        waitForExpectations(timeout: 1)
+    }
+
+    // MARK: Denesification
+    func testDenestification_ThreeValues() {
+        // :given
+        let a = 1
+        let b = 2.0
+        let c = "C"
+        let refValues = (a, b, c)
+        let t2v1 = [((a, b), c)].publisher
+        let v1t2 = [(a, (b, c))].publisher
+
+        // :when
+        var values: [(Int, Double, String)] = []
+        Publishers.Merge(
+            t2v1.denestify(),
+            v1t2.denestify()
+        )
+        .sink {
+            values.append($0)
+        }
+        .store(in: &cancellables)
+
+        // :then
+        XCTAssertTrue(values.allSatisfy { $0 == refValues})
+    }
+
+    func testDenestification_FourValues() {
+        // :given
+        let a = 1
+        let b = 2.0
+        let c = "C"
+        let d = Date()
+        let refValues = (a, b, c, d)
+        let t2v2 = [((a, b), c, d)].publisher
+        let v1t2v1 = [(a, (b, c), d)].publisher
+        let v2t2 = [(a, b, (c, d))].publisher
+        let t2t2 = [((a, b), (c, d))].publisher
+        let t3v1 = [((a, b, c), d)].publisher
+        let v1t3 = [(a, (b, c, d))].publisher
+
+        let t2t1v1 = [(((a, b), c), d)].publisher
+        let t1t2v1 = [((a, (b, c)), d)].publisher
+        let v1t2t1 = [(a, ((b, c), d))].publisher
+        let v1t1t2 = [(a, (b, (c, d)))].publisher
+
+        // :when
+        var values: [(Int, Double, String, Date)] = []
+        Publishers.MergeMany([
+            t2v2.denestify(),
+            v1t2v1.denestify(),
+            v2t2.denestify(),
+            t2t2.denestify(),
+            t3v1.denestify(),
+            v1t3.denestify(),
+            t2t1v1.denestify(),
+            t1t2v1.denestify(),
+            v1t2t1.denestify(),
+            v1t1t2.denestify()
+        ])
+        .sink {
+            values.append($0)
+        }
+        .store(in: &cancellables)
+
+        // :then
+        XCTAssertTrue(values.allSatisfy { $0 == refValues})
+    }
 }
 
 PublisherTest.defaultTestSuite.run()
+
+extension Materialized: Equatable where Value: Equatable, Failure: Equatable {
+    public static func == (lhs: Materialized, rhs: Materialized) -> Bool {
+        switch (lhs, rhs) {
+        case (.completed, .completed): return true
+        case (.failed(let le), .failed(let re)): return le == re
+        case (.value(let lv), .value(let rv)): return lv == rv
+        default: return false
+        }
+    }
+}
